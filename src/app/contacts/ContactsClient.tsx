@@ -21,6 +21,84 @@ import { DataTable, type DataTableColumn } from "@/components/DataTable";
 import { getFirebase } from "@/lib/firebase";
 import type { Contact } from "@/lib/types";
 
+type MergedContact = Contact & { _dupCount?: number; _dupIds?: string[] };
+
+// Normalize a phone to digits only so "+1 (510) 555-1212" and "5105551212" match.
+function normPhone(p?: string | null): string {
+  return (p || "").replace(/\D+/g, "");
+}
+// Lowercase the domain and strip leading "www." so "WWW.Acme.com" and "acme.com" match.
+function normDomain(d?: string | null): string {
+  return (d || "").toLowerCase().replace(/^www\./, "").trim();
+}
+function normText(s?: string | null): string {
+  return (s || "").toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+// Pick the strongest stable key we have for this contact.
+// Priority: Google CID (most stable) → phone → website domain → name+address.
+function dedupKey(c: Contact): string {
+  if (c.cid) return "cid:" + c.cid;
+  const phone = normPhone(c.phone || c.phone_display);
+  if (phone.length >= 7) return "phone:" + phone;
+  const dom = normDomain(c.website_domain || c.website);
+  if (dom) return "dom:" + dom;
+  const na = normText(c.name) + "|" + normText(c.address);
+  if (na.length > 1) return "na:" + na;
+  return "id:" + c.id; // fall back to unique = no dedup
+}
+
+// How "complete" a contact is. Used to choose which row wins a tie.
+function completeness(c: Contact): number {
+  return [
+    c.phone, c.website, c.email, c.address, c.rating,
+    c.category, c.hours, c.description, c.cid,
+    c.photo_urls?.length, c.hours_weekly && Object.keys(c.hours_weekly).length,
+  ].filter(Boolean).length;
+}
+
+// Merge `b` into `a` field-by-field — non-empty wins, latest updated_at wins.
+function mergeContacts(a: MergedContact, b: Contact): MergedContact {
+  const out: MergedContact = { ...a };
+  for (const [k, v] of Object.entries(b) as [keyof Contact, unknown][]) {
+    const cur = out[k];
+    const aEmpty = cur === undefined || cur === null || cur === "" ||
+      (Array.isArray(cur) && cur.length === 0);
+    const bEmpty = v === undefined || v === null || v === "" ||
+      (Array.isArray(v) && v.length === 0);
+    if (bEmpty) continue;
+    if (aEmpty) { (out as unknown as Record<string, unknown>)[k] = v; continue; }
+    // Both present — keep the value from whichever row was updated more recently.
+    if ((b.updated_at || 0) > (a.updated_at || 0)) {
+      (out as unknown as Record<string, unknown>)[k] = v;
+    }
+  }
+  // Track that we collapsed multiple Firestore docs into this one row.
+  out._dupCount = (out._dupCount || 1) + 1;
+  out._dupIds = [...(out._dupIds || [a.id]), b.id];
+  return out;
+}
+
+function dedupeContacts(rows: Contact[]): MergedContact[] {
+  const groups = new Map<string, Contact[]>();
+  for (const r of rows) {
+    const k = dedupKey(r);
+    const g = groups.get(k);
+    if (g) g.push(r);
+    else groups.set(k, [r]);
+  }
+  const out: MergedContact[] = [];
+  for (const group of groups.values()) {
+    if (group.length === 1) { out.push(group[0]); continue; }
+    // Seed with the most-complete row, then merge the rest into it.
+    const sorted = group.slice().sort((x, y) => completeness(y) - completeness(x));
+    let merged: MergedContact = { ...sorted[0], _dupCount: 1, _dupIds: [sorted[0].id] };
+    for (let i = 1; i < sorted.length; i++) merged = mergeContacts(merged, sorted[i]);
+    out.push(merged);
+  }
+  return out;
+}
+
 const COLS: DataTableColumn[] = [
   "Business",
   "Category",
@@ -103,10 +181,21 @@ export function ContactsClient() {
     return Array.from(set).sort();
   }, [contacts]);
 
+  // Step 1: collapse duplicates ACROSS Firestore docs into single merged rows.
+  //   - same Google CID            → same business (most reliable)
+  //   - same phone (digits-only)   → same business
+  //   - same website domain        → same business
+  //   - same name + address        → same business
+  // Same place_url re-scrapes are already merged server-side (sha1 doc id),
+  // this catches Maps duplicate listings + legacy random-id docs.
+  const deduped = useMemo<MergedContact[]>(
+    () => dedupeContacts(contacts || []),
+    [contacts],
+  );
+
   const filtered = useMemo(() => {
-    if (!contacts) return [];
     const needle = q.trim().toLowerCase();
-    return contacts.filter((c) => {
+    return deduped.filter((c) => {
       if (hasPhone && !c.phone && !c.phone_display) return false;
       if (hasWebsite && !c.website) return false;
       if (hasEmail && !c.email) return false;
@@ -129,7 +218,7 @@ export function ContactsClient() {
         .toLowerCase();
       return hay.includes(needle);
     });
-  }, [contacts, q, hasPhone, hasWebsite, hasEmail, minRating, categoryFilter]);
+  }, [deduped, q, hasPhone, hasWebsite, hasEmail, minRating, categoryFilter]);
 
   function exportJson() {
     const blob = new Blob([JSON.stringify(filtered, null, 2)], {
@@ -202,18 +291,18 @@ export function ContactsClient() {
 
       {/* Stat cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-5">
-        <Stat label="Total Contacts" value={contacts?.length ?? "—"} />
+        <Stat label="Total Contacts" value={deduped.length || "—"} />
         <Stat
           label="With Phone"
-          value={contacts?.filter((c) => c.phone || c.phone_display).length ?? "—"}
+          value={deduped.filter((c) => c.phone || c.phone_display).length || "—"}
         />
         <Stat
           label="With Website"
-          value={contacts?.filter((c) => c.website).length ?? "—"}
+          value={deduped.filter((c) => c.website).length || "—"}
         />
         <Stat
           label="With Email"
-          value={contacts?.filter((c) => c.email).length ?? "—"}
+          value={deduped.filter((c) => c.email).length || "—"}
         />
       </div>
 
@@ -288,7 +377,17 @@ export function ContactsClient() {
           {filtered.map((c) => (
             <tr key={c.id} className="hover:bg-gray-50/60">
               <td className="whitespace-nowrap py-4 pl-4 pr-3 text-sm sm:pl-6">
-                <div className="font-semibold text-gray-900">{c.name}</div>
+                <div className="flex items-center gap-2">
+                  <span className="font-semibold text-gray-900">{c.name}</span>
+                  {c._dupCount && c._dupCount > 1 && (
+                    <span
+                      title={`Merged from ${c._dupCount} duplicate listings`}
+                      className="inline-flex items-center rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700 ring-1 ring-inset ring-amber-200"
+                    >
+                      ×{c._dupCount}
+                    </span>
+                  )}
+                </div>
                 {c.source_query && (
                   <div className="text-xs text-gray-400 mt-0.5">
                     {c.source_query}

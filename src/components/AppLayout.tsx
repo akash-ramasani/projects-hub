@@ -235,17 +235,14 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
 
   // Login page: just render — no sidebar / topbar.
   if (isPublic) {
-    return <div className="min-h-screen bg-gray-50">{children}</div>;
+    return <div className="min-h-screen bg-[#F6FBF8]">{children}</div>;
   }
 
   // Splash while auth state is resolving / redirect is happening.
   if (loading || !user || !allowed) {
     return (
-      <div className="min-h-screen grid place-items-center bg-white">
-        <div className="flex items-center gap-2 text-sm text-gray-500">
-          <ArrowPathIcon className="size-4 animate-spin" />
-          Loading…
-        </div>
+      <div className="flex min-h-screen items-center justify-center bg-[#F6FBF8]">
+        <div className="h-8 w-8 border-4 border-[#2BB673] border-t-transparent rounded-full animate-spin" />
       </div>
     );
   }

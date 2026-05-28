@@ -3,9 +3,11 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   collection,
+  doc,
   onSnapshot,
   orderBy,
   query as fsQuery,
+  writeBatch,
 } from "firebase/firestore";
 import {
   MagnifyingGlassIcon,
@@ -15,6 +17,7 @@ import {
   EnvelopeIcon,
   StarIcon,
   ArrowPathIcon,
+  TrashIcon,
 } from "@heroicons/react/24/outline";
 import { PageHeader } from "@/components/PageHeader";
 import { DataTable, type DataTableColumn } from "@/components/DataTable";
@@ -35,20 +38,28 @@ function normText(s?: string | null): string {
   return (s || "").toLowerCase().replace(/\s+/g, " ").trim();
 }
 
-// Pick the strongest stable key we have for this contact.
-// Priority: Google CID (most stable) → phone → website domain → name+address.
-function dedupKey(c: Contact): string {
-  if (c.cid) return "cid:" + c.cid;
+// Identity tokens a contact contributes to the dedup graph. Two contacts that
+// share ANY token end up in the same group (union-find). This catches the case
+// where a single business has multiple Google Maps listings with different CIDs.
+function identityTokens(c: Contact): string[] {
+  const t: string[] = [];
+  if (c.cid)  t.push("cid:"  + c.cid);
+  if (c.ftid) t.push("ftid:" + c.ftid);
+  if (c.chij) t.push("chij:" + c.chij);
   const phone = normPhone(c.phone || c.phone_display);
-  if (phone.length >= 7) return "phone:" + phone;
+  if (phone.length >= 7) t.push("phone:" + phone);
   const dom = normDomain(c.website_domain || c.website);
-  if (dom) return "dom:" + dom;
+  // Skip generic platform domains that many businesses share. Adding these as
+  // tokens would incorrectly group unrelated listings together.
+  if (dom && !/^(facebook|instagram|twitter|youtube|tiktok|linkedin|wixsite|forms\.gle|homesnap|realtystore|locations\.[a-z]+|shop\.[a-z]+)\.[a-z.]+$/.test(dom)) {
+    t.push("dom:" + dom);
+  }
   const na = normText(c.name) + "|" + normText(c.address);
-  if (na.length > 1) return "na:" + na;
-  return "id:" + c.id; // fall back to unique = no dedup
+  if (na.length > 1 && c.address) t.push("na:" + na);
+  return t;
 }
 
-// How "complete" a contact is. Used to choose which row wins a tie.
+// How "complete" a contact is. Used to pick the seed row in each group.
 function completeness(c: Contact): number {
   return [
     c.phone, c.website, c.email, c.address, c.rating,
@@ -73,25 +84,53 @@ function mergeContacts(a: MergedContact, b: Contact): MergedContact {
       (out as unknown as Record<string, unknown>)[k] = v;
     }
   }
-  // Track that we collapsed multiple Firestore docs into this one row.
   out._dupCount = (out._dupCount || 1) + 1;
   out._dupIds = [...(out._dupIds || [a.id]), b.id];
   return out;
 }
 
+// Union-find: every contact contributes multiple identity tokens; any two
+// contacts that share at least one token end up in the same group.
 function dedupeContacts(rows: Contact[]): MergedContact[] {
-  const groups = new Map<string, Contact[]>();
-  for (const r of rows) {
-    const k = dedupKey(r);
-    const g = groups.get(k);
-    if (g) g.push(r);
-    else groups.set(k, [r]);
-  }
+  const parent = new Map<number, number>();
+  const find = (i: number): number => {
+    let p = parent.get(i) ?? i;
+    while (p !== (parent.get(p) ?? p)) p = parent.get(p) ?? p;
+    parent.set(i, p);
+    return p;
+  };
+  const union = (a: number, b: number) => {
+    const ra = find(a), rb = find(b);
+    if (ra !== rb) parent.set(ra, rb);
+  };
+
+  // Token → first row index that owns it. Subsequent rows union with the owner.
+  const tokenOwner = new Map<string, number>();
+  rows.forEach((r, i) => {
+    parent.set(i, i);
+    for (const tok of identityTokens(r)) {
+      const owner = tokenOwner.get(tok);
+      if (owner === undefined) tokenOwner.set(tok, i);
+      else union(i, owner);
+    }
+  });
+
+  // Collect indices into groups by root.
+  const groups = new Map<number, number[]>();
+  rows.forEach((_, i) => {
+    const r = find(i);
+    const g = groups.get(r);
+    if (g) g.push(i);
+    else groups.set(r, [i]);
+  });
+
+  // Merge each group.
   const out: MergedContact[] = [];
-  for (const group of groups.values()) {
-    if (group.length === 1) { out.push(group[0]); continue; }
-    // Seed with the most-complete row, then merge the rest into it.
-    const sorted = group.slice().sort((x, y) => completeness(y) - completeness(x));
+  for (const indices of groups.values()) {
+    if (indices.length === 1) { out.push(rows[indices[0]]); continue; }
+    const sorted = indices
+      .map((i) => rows[i])
+      .sort((x, y) => completeness(y) - completeness(x));
     let merged: MergedContact = { ...sorted[0], _dupCount: 1, _dupIds: [sorted[0].id] };
     for (let i = 1; i < sorted.length; i++) merged = mergeContacts(merged, sorted[i]);
     out.push(merged);
@@ -220,6 +259,62 @@ export function ContactsClient() {
     });
   }, [deduped, q, hasPhone, hasWebsite, hasEmail, minRating, categoryFilter]);
 
+  // ── One-click duplicate cleanup ──────────────────────────────────────────
+  // For each UI-merged group (×N badge), write the merged contact back to ONE
+  // canonical Firestore doc (the most-complete row's id) and DELETE the other
+  // doc(s). After this runs, the badges disappear and Firestore matches what
+  // you already see in the table.
+  const [cleaning, setCleaning] = useState(false);
+  const dupGroups = useMemo(
+    () => deduped.filter((c) => (c._dupCount || 1) > 1),
+    [deduped],
+  );
+  const dupExcessCount = useMemo(
+    () => dupGroups.reduce((n, c) => n + ((c._dupCount || 1) - 1), 0),
+    [dupGroups],
+  );
+
+  async function cleanDuplicates() {
+    if (!dupGroups.length || cleaning) return;
+    if (
+      !confirm(
+        `Permanently delete ${dupExcessCount} duplicate Firestore document${
+          dupExcessCount === 1 ? "" : "s"
+        }?\n\nEach merged row will collapse to a single canonical document. This cannot be undone.`,
+      )
+    )
+      return;
+    setCleaning(true);
+    try {
+      const { db } = getFirebase();
+      let totalDeleted = 0;
+      // Firestore batches cap at 500 writes. Chunk groups so each batch stays safe.
+      const CHUNK = 100; // each group ≈ 1-3 writes → 100 groups ≈ ≤400 writes
+      for (let i = 0; i < dupGroups.length; i += CHUNK) {
+        const slice = dupGroups.slice(i, i + CHUNK);
+        const batch = writeBatch(db);
+        for (const merged of slice) {
+          const ids = merged._dupIds || [];
+          if (ids.length < 2) continue;
+          const [keepId, ...dropIds] = ids;
+          // Write the merged snapshot back to the canonical doc so it carries
+          // every field from every duplicate (set with merge=true).
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
+          const { _dupCount, _dupIds, id: _id, ...payload } = merged;
+          batch.set(doc(db, "contacts", keepId), payload, { merge: true });
+          for (const did of dropIds) batch.delete(doc(db, "contacts", did));
+          totalDeleted += dropIds.length;
+        }
+        await batch.commit();
+      }
+      alert(`Cleanup complete. Deleted ${totalDeleted} duplicate document${totalDeleted === 1 ? "" : "s"}.`);
+    } catch (e) {
+      alert("Cleanup failed: " + (e as Error).message);
+    } finally {
+      setCleaning(false);
+    }
+  }
+
   function exportJson() {
     const blob = new Blob([JSON.stringify(filtered, null, 2)], {
       type: "application/json",
@@ -271,6 +366,21 @@ export function ContactsClient() {
         description="Business contact data scraped from Google Maps and saved to Firestore. Filter, search, and export."
         actions={
           <>
+            {dupExcessCount > 0 && (
+              <button
+                onClick={cleanDuplicates}
+                disabled={cleaning}
+                title={`Permanently delete ${dupExcessCount} duplicate documents in Firestore`}
+                className="inline-flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm font-semibold text-amber-700 shadow-xs hover:bg-amber-100 active:scale-95 transition disabled:opacity-50"
+              >
+                {cleaning ? (
+                  <ArrowPathIcon className="size-4 animate-spin" />
+                ) : (
+                  <TrashIcon className="size-4" />
+                )}
+                Clean {dupExcessCount} dup{dupExcessCount === 1 ? "" : "s"}
+              </button>
+            )}
             <button
               onClick={exportCsv}
               disabled={!filtered.length}

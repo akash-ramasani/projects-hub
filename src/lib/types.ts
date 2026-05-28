@@ -47,8 +47,9 @@ export interface Contact {
   claim_status?: string;                     // e.g. "unclaimed", "owner-verified"
 
   // ── Provenance ──────────────────────────────────────────────────────────
-  scraped_at?: string;                       // ISO
-  updated_at?: string;                       // ISO, written server-side
+  scraped_at?: string;                       // ISO, last scrape in browser
+  updated_at?: string;                       // ISO, set on every Firestore write
+  first_seen_at?: string;                    // ISO, written ONCE on first sync
   source_query?: string;                     // search label / search URL
 }
 

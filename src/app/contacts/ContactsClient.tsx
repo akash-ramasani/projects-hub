@@ -14,13 +14,13 @@ import {
   ArrowDownTrayIcon,
   GlobeAltIcon,
   PhoneIcon,
-  EnvelopeIcon,
   StarIcon,
   ArrowPathIcon,
   TrashIcon,
 } from "@heroicons/react/24/outline";
 import { PageHeader } from "@/components/PageHeader";
 import { DataTable, type DataTableColumn } from "@/components/DataTable";
+import { Select } from "@/components/Select";
 import { getFirebase } from "@/lib/firebase";
 import type { Contact } from "@/lib/types";
 
@@ -140,12 +140,9 @@ function dedupeContacts(rows: Contact[]): MergedContact[] {
 
 const COLS: DataTableColumn[] = [
   "Business",
-  "Category",
-  { label: "Rating", className: "text-right" },
+  "Rating",
   "Phone",
   "Website",
-  "Email",
-  "Address",
   { label: "Actions", srOnly: true },
 ];
 
@@ -182,13 +179,66 @@ function Toggle({
   );
 }
 
+// 5-star visual with colored fill proportional to the score, plus the numeric
+// value and review count. Compact and scannable.
+function RatingCell({
+  rating,
+  reviews,
+}: {
+  rating?: number | null;
+  reviews?: number | null;
+}) {
+  if (!rating) {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full bg-gray-50 px-2 py-0.5 text-xs font-medium text-gray-400 ring-1 ring-inset ring-gray-200">
+        Unrated
+      </span>
+    );
+  }
+  const pct = Math.max(0, Math.min(100, (rating / 5) * 100));
+  const tone =
+    rating >= 4.5
+      ? "text-emerald-700 bg-emerald-50 ring-emerald-200"
+      : rating >= 4
+        ? "text-amber-700 bg-amber-50 ring-amber-200"
+        : rating >= 3
+          ? "text-orange-700 bg-orange-50 ring-orange-200"
+          : "text-rose-700 bg-rose-50 ring-rose-200";
+  return (
+    <div className="inline-flex items-center gap-2">
+      <span
+        className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-semibold ring-1 ring-inset ${tone}`}
+      >
+        <StarIcon className="size-3.5" />
+        {rating.toFixed(1)}
+      </span>
+      <span
+        className="relative inline-block leading-none"
+        aria-hidden="true"
+        title={`${rating.toFixed(1)} out of 5`}
+      >
+        <span className="text-gray-200 tracking-tight text-base">★★★★★</span>
+        <span
+          className="absolute inset-0 overflow-hidden text-amber-400 tracking-tight text-base"
+          style={{ width: `${pct}%` }}
+        >
+          ★★★★★
+        </span>
+      </span>
+      {reviews != null && (
+        <span className="text-xs text-gray-400">({reviews})</span>
+      )}
+    </div>
+  );
+}
+
 export function ContactsClient() {
   const [contacts, setContacts] = useState<Contact[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [q, setQ] = useState("");
   const [hasPhone, setHasPhone] = useState(false);
   const [hasWebsite, setHasWebsite] = useState(false);
-  const [hasEmail, setHasEmail] = useState(false);
+  const [noWebsite, setNoWebsite] = useState(false);
   const [minRating, setMinRating] = useState(0);
   const [categoryFilter, setCategoryFilter] = useState("");
 
@@ -235,9 +285,10 @@ export function ContactsClient() {
   const filtered = useMemo(() => {
     const needle = q.trim().toLowerCase();
     return deduped.filter((c) => {
+      if (!c.rating) return false; // hide unrated
       if (hasPhone && !c.phone && !c.phone_display) return false;
       if (hasWebsite && !c.website) return false;
-      if (hasEmail && !c.email) return false;
+      if (noWebsite && c.website) return false;
       if (minRating > 0 && (c.rating ?? 0) < minRating) return false;
       if (categoryFilter && c.category !== categoryFilter) return false;
       if (!needle) return true;
@@ -249,7 +300,6 @@ export function ContactsClient() {
         c.phone_display,
         c.website,
         c.website_domain,
-        c.email,
         c.source_query,
       ]
         .filter(Boolean)
@@ -257,7 +307,7 @@ export function ContactsClient() {
         .toLowerCase();
       return hay.includes(needle);
     });
-  }, [deduped, q, hasPhone, hasWebsite, hasEmail, minRating, categoryFilter]);
+  }, [deduped, q, hasPhone, hasWebsite, noWebsite, minRating, categoryFilter]);
 
   // ── One-click duplicate cleanup ──────────────────────────────────────────
   // For each UI-merged group (×N badge), write the merged contact back to ONE
@@ -400,7 +450,7 @@ export function ContactsClient() {
       />
 
       {/* Stat cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-5">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-5">
         <Stat label="Total Contacts" value={deduped.length || "—"} />
         <Stat
           label="With Phone"
@@ -410,53 +460,55 @@ export function ContactsClient() {
           label="With Website"
           value={deduped.filter((c) => c.website).length || "—"}
         />
-        <Stat
-          label="With Email"
-          value={deduped.filter((c) => c.email).length || "—"}
-        />
       </div>
 
       {/* Filter bar */}
       <div className="mt-6 rounded-2xl bg-white shadow-xs ring-1 ring-black/5 p-5">
-        <div className="flex flex-col lg:flex-row lg:items-center gap-3">
-          <div className="relative flex-1">
-            <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3">
-              <MagnifyingGlassIcon className="size-5 text-gray-400" />
+        <div className="grid grid-cols-1 gap-3 lg:grid-cols-[1fr_220px_180px] lg:items-end">
+          <div>
+            <label htmlFor="contacts-search" className="block text-sm/6 font-medium text-gray-900">
+              Search
+            </label>
+            <div className="relative mt-2">
+              <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3">
+                <MagnifyingGlassIcon className="size-5 text-gray-400" />
+              </div>
+              <input
+                id="contacts-search"
+                value={q}
+                onChange={(e) => setQ(e.target.value)}
+                placeholder="Search name, category, address…"
+                className="block w-full rounded-md bg-white py-1.5 pr-3 pl-10 text-base text-gray-900 outline-1 -outline-offset-1 outline-gray-300 placeholder:text-gray-400 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-[#2BB673] sm:text-sm/6"
+              />
             </div>
-            <input
-              value={q}
-              onChange={(e) => setQ(e.target.value)}
-              placeholder="Search name, category, address, email…"
-              className="block w-full rounded-lg border-0 py-2 pl-10 text-gray-900 ring-1 ring-inset ring-gray-300 placeholder:text-gray-400 focus:outline-[#2BB673] focus:ring-4 focus:ring-[#2BB673]/10 transition-all sm:text-sm/6"
-            />
           </div>
-          <select
+          <Select
+            id="contacts-category"
+            label="Category"
             value={categoryFilter}
-            onChange={(e) => setCategoryFilter(e.target.value)}
-            className="rounded-lg ring-1 ring-inset ring-gray-300 py-2 px-3 text-sm text-gray-700 bg-white focus:outline-[#2BB673]"
-          >
-            <option value="">All categories</option>
-            {categories.map((c) => (
-              <option key={c} value={c}>
-                {c}
-              </option>
-            ))}
-          </select>
-          <select
-            value={minRating}
-            onChange={(e) => setMinRating(Number(e.target.value))}
-            className="rounded-lg ring-1 ring-inset ring-gray-300 py-2 px-3 text-sm text-gray-700 bg-white focus:outline-[#2BB673]"
-          >
-            <option value={0}>Any rating</option>
-            <option value={3}>≥ 3.0 ★</option>
-            <option value={4}>≥ 4.0 ★</option>
-            <option value={4.5}>≥ 4.5 ★</option>
-          </select>
+            onChange={setCategoryFilter}
+            options={[
+              { value: "", label: "All categories" },
+              ...categories.map((c) => ({ value: c, label: c })),
+            ]}
+          />
+          <Select
+            id="contacts-rating"
+            label="Minimum rating"
+            value={String(minRating)}
+            onChange={(v) => setMinRating(Number(v))}
+            options={[
+              { value: "0", label: "Any rating" },
+              { value: "3", label: "≥ 3.0 ★" },
+              { value: "4", label: "≥ 4.0 ★" },
+              { value: "4.5", label: "≥ 4.5 ★" },
+            ]}
+          />
         </div>
-        <div className="mt-3 flex flex-wrap items-center gap-x-5 gap-y-2">
+        <div className="mt-4 flex flex-wrap items-center gap-x-5 gap-y-2">
           <Toggle checked={hasPhone} onChange={setHasPhone} label="Has phone" />
           <Toggle checked={hasWebsite} onChange={setHasWebsite} label="Has website" />
-          <Toggle checked={hasEmail} onChange={setHasEmail} label="Has email" />
+          <Toggle checked={noWebsite} onChange={setNoWebsite} label="No website" />
           <span className="text-xs text-gray-500 ml-auto">
             Showing <span className="font-semibold text-gray-900">{filtered.length}</span> of{" "}
             {contacts?.length ?? 0}
@@ -498,35 +550,9 @@ export function ContactsClient() {
                     </span>
                   )}
                 </div>
-                {c.source_query && (
-                  <div className="text-xs text-gray-400 mt-0.5">
-                    {c.source_query}
-                  </div>
-                )}
               </td>
-              <td className="whitespace-nowrap px-3 py-4 text-sm text-gray-600">
-                {c.category ? (
-                  <span className="inline-flex items-center rounded-md bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700 ring-1 ring-inset ring-emerald-200">
-                    {c.category}
-                  </span>
-                ) : (
-                  <span className="text-gray-300">—</span>
-                )}
-              </td>
-              <td className="whitespace-nowrap px-3 py-4 text-sm text-right">
-                {c.rating ? (
-                  <span className="inline-flex items-center gap-1 font-semibold text-gray-900">
-                    <StarIcon className="size-4 text-amber-500" />
-                    {c.rating.toFixed(1)}
-                    {c.reviews != null && (
-                      <span className="text-xs font-normal text-gray-400">
-                        ({c.reviews})
-                      </span>
-                    )}
-                  </span>
-                ) : (
-                  <span className="text-gray-300">—</span>
-                )}
+              <td className="whitespace-nowrap px-3 py-4 text-sm">
+                <RatingCell rating={c.rating} reviews={c.reviews} />
               </td>
               <td className="whitespace-nowrap px-3 py-4 text-sm">
                 {c.phone || c.phone_display ? (
@@ -553,24 +579,10 @@ export function ContactsClient() {
                     {c.website_domain || c.website.replace(/^https?:\/\//, "").replace(/\/$/, "")}
                   </a>
                 ) : (
-                  <span className="text-gray-300">—</span>
+                  <span className="inline-flex items-center gap-1 rounded-full bg-rose-50 px-2 py-0.5 text-xs font-medium text-rose-600 ring-1 ring-inset ring-rose-200">
+                    No website
+                  </span>
                 )}
-              </td>
-              <td className="whitespace-nowrap px-3 py-4 text-sm">
-                {c.email ? (
-                  <a
-                    href={`mailto:${c.email}`}
-                    className="inline-flex items-center gap-1.5 text-gray-700 hover:text-[#2BB673]"
-                  >
-                    <EnvelopeIcon className="size-4 text-gray-400" />
-                    {c.email}
-                  </a>
-                ) : (
-                  <span className="text-gray-300">—</span>
-                )}
-              </td>
-              <td className="px-3 py-4 text-sm text-gray-600 max-w-xs">
-                <div className="line-clamp-2">{c.address || "—"}</div>
               </td>
               <td className="whitespace-nowrap relative py-4 pl-3 pr-4 text-right text-sm sm:pr-6">
                 <a
